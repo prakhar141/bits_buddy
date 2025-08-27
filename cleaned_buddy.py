@@ -18,11 +18,6 @@ from langchain.docstore.document import Document
 
 import firebase_admin
 from firebase_admin import credentials, auth, db
-from firebase_admin import credentials, firestore
-import streamlit as st
-
-for key in st.session_state.keys():
-    del st.session_state[key]
 
 # ========== CONFIG (tweak these models per your OpenRouter access) ==========
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or "YOUR_API_KEY"
@@ -36,15 +31,58 @@ K_VAL = int(os.getenv("K_VAL") or 4)
 
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH") or "./llm_cache.db"
 ENABLE_PERSISTENT_CACHE = True
-st.set_page_config(page_title="BITS Buddy", layout="wide")
+
 # ----------------- utilities for firebase chat history -----------------
+def load_user_chat_history(uid: str) -> List[Dict[str, Any]]:
+    try:
+        ref = db.reference(f"user_chats/{uid}")
+        snapshot = ref.get()
+        if not snapshot:
+            return []
+        chat_data = snapshot.get("chat")
+        if isinstance(chat_data, list):
+            return chat_data
+        st.warning(f"Unexpected chat format for UID {uid}, resetting history.")
+        return []
+    except Exception as e:
+        st.error(f"Failed to load chat history for UID {uid}: {e}")
+        return []
+
+
+def save_user_chat_history(uid: str, chat: List[Dict[str, Any]]) -> bool:
+    try:
+        ref = db.reference(f"user_chats/{uid}")
+        ref.set({"chat": chat})
+        return True
+    except Exception as e:
+        st.error(f"Failed to save chat history for UID {uid}: {e}")
+        return False
 
 # ----------------- FIREBASE INIT -----------------
+if not firebase_admin._apps:
+    try:
+        firebase_config = dict(st.secrets["firebase"])
+        firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
+        database_url = st.secrets["firebase"]["database_url"]
+        cred = credentials.Certificate(firebase_config)
+        firebase_admin.initialize_app(cred, {"databaseURL": database_url})
+    except Exception as e:
+        st.error(f"Firebase initialization failed: {e}")
+        st.stop()
+else:
+    firebase_admin.get_app()
+
+realtime_db = db.reference('/')
+
 # ----------------- Streamlit page & sidebar -----------------
+st.set_page_config(page_title="BITS Buddy", layout="wide")
+col1, col2 = st.columns([1, 5])
 
-#col1, col2 = st.columns([1, 5])
+with col1:
+    st.image("bits_logo.jpg", width=60)
 
-st.markdown("<h1 style='margin-top: 10px;'>BITS Buddy</h1>", unsafe_allow_html=True)
+with col2:
+    st.markdown("<h1 style='margin-top: 10px;'>BITS Buddy</h1>", unsafe_allow_html=True)
 
 st.markdown("Ask me anything about BITS Pilani")
 
@@ -63,9 +101,9 @@ with st.sidebar:
         st.rerun()
 
     language = st.selectbox("🌐 Response Language", ["English", "Hindi", "Telugu", "Tamil", "Marathi", "Bengali"])
-    st.checkbox("🧠Deep Think", value=False, key="use_smart_llm") 
+    #st.checkbox("🧠Deep Think", value=False, key="use_smart_llm") 
     st.markdown("---")
-    st.checkbox("For fast loading", value=ENABLE_PERSISTENT_CACHE, key="enable_sqlite")
+    #st.checkbox("For fast loading", value=ENABLE_PERSISTENT_CACHE, key="enable_sqlite")
 
 # ----------------- SQLITE CACHE -----------------
 def init_sqlite(db_path: str = SQLITE_DB_PATH):
@@ -241,7 +279,7 @@ def build_thinking_prompt(question: str, context: str) -> List[Dict[str, str]]:
 
 def build_primary_prompt(context: str, question: str, lang: str) -> List[Dict[str, str]]:
     return [
-        {"role": "system", "content": (f"You are BitsBuddy, a BITSian senior. Answer in {lang}. "
+        {"role": "system", "content": (f"You are BitsBuddy, a BITSian Assistant. Answer in {lang}. "
                                        "Use emojis, be concise and helpful. Provide actionable steps if relevant.Answer questions which are relevanto bits only.otherwise politely tell ur capabilities")},
         {"role": "user", "content": scratchpad_reasoning(context, question)}
     ]
@@ -296,24 +334,170 @@ def vanilla_rag_answer(context: str, question: str, lang: str = "English") -> st
         return f"⚠️ Error generating answer: {e}"
 
 # ----------------- Session init -----------------
+if "authenticated" in st.session_state and st.session_state["authenticated"]:
+    if "chat_history" not in st.session_state:
+        uid = st.session_state.get("user_uid")
+        st.session_state.chat_history = load_user_chat_history(uid) if uid else []
+    if "just_streamed" not in st.session_state:
+        st.session_state.just_streamed = False
+else:
+    # show login screen if not authenticated (define login_screen elsewhere or reuse your function)
+    def login_screen():
+        st.title("🔐 BITS Buddy Login")
+        st.markdown("Please log in to continue")
+        name = st.text_input("Full Name")
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        if st.button("Login / Sign Up"):
+            if not name or not email or not password:
+                st.error("Please fill in all fields.")
+                return False
+            try:
+                email_norm = email.strip().lower()
+                try:
+                    user = auth.get_user_by_email(email_norm)
+                    st.success(f"Welcome back, {user.display_name or name}!")
+                    st.session_state.uid = user.uid
+                    st.session_state.chat_history = load_user_chat_history(user.uid)
+                except auth.UserNotFoundError:
+                    user = auth.create_user(email=email_norm, password=password, display_name=name)
+                    st.success(f"Account created! Welcome, {name}!")
+                    st.session_state.uid = user.uid
+                    st.session_state.chat_history = []
+                st.session_state["user_uid"] = user.uid
+                st.session_state["user_name"] = name
+                st.session_state["authenticated"] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"Authentication failed: {e}")
+                return False
 
-# Chat input - single place that drives everything
+    login_screen()
+    st.stop()
 
-# Ensure chat history exists
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+# ----------------- Main chat handler (auto pipeline selection) -----------------
+import time
+import streamlit as st
+from sentence_transformers import SentenceTransformer, util
 
+st.title(f"Welcome {st.session_state.get('user_name', 'User')} 👋")
+
+# ----------------------
+# 1️⃣ Load embedding model
+# ----------------------
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Reference queries that always need deep reasoning
+deep_reasoning_refs = [
+    "Explain how something works",
+    "Compare advantages and disadvantages",
+    "Predict the outcome based on data",
+    "Evaluate the process step by step",
+    "Explain the impact or effect of X",
+    "Provide a detailed reasoning or analysis"
+]
+deep_ref_embeddings = embed_model.encode(deep_reasoning_refs, convert_to_tensor=True)
+
+# ----------------------
+# 2️⃣ DeepThink heuristic
+# ----------------------
+def should_use_deepthink(query: str) -> bool:
+    """Decides if a query needs deep reasoning."""
+    q = query.strip().lower()
+
+    # keyword heuristics
+    reasoning_keywords = [
+        "why", "how", "explain", "difference", "compare",
+        "advantages", "disadvantages", "steps", "process",
+        "predict", "evaluate", "simulate", "impact", "effect"
+    ]
+    factoid_keywords = [
+        "what is", "who is", "when is", "define",
+        "location", "fee", "contact", "hostel", "mess", "address"
+    ]
+
+    if any(k in q for k in reasoning_keywords):
+        return True
+    if any(k in q for k in factoid_keywords):
+        return False
+
+    # length heuristic
+    if len(q.split()) > 15:
+        return True
+
+    # semantic similarity
+    query_embedding = embed_model.encode(q, convert_to_tensor=True)
+    score = util.cos_sim(query_embedding, deep_ref_embeddings).max().item()
+    return score > 0.6
+# ----------------------
+# 3️⃣ Modular pipeline executor
+# ----------------------
+def execute_pipeline(query: str, context: str, language: str, deepthink: bool):
+    mode_badge = "🧠 Deep Thinking" if deepthink else "⚡ Quick Answer"
+    placeholder = st.empty()
+    final_answer = ""
+    rag_result = {}
+
+    try:
+        placeholder.markdown(f"{mode_badge} — preparing response...")
+
+        if deepthink:
+            thinking_prompt = build_thinking_prompt(query, context)
+            thinking_text = query_models_with_fallbacks([MODEL_CHEAP] + MODEL_FALLBACKS, thinking_prompt)
+
+            # Animate reasoning output
+            animated = ""
+            for ch in thinking_text:
+                animated += ch
+                placeholder.markdown(f"{mode_badge}\n\n**Thinking:** {animated}|")
+                time.sleep(0.01)
+            placeholder.markdown(f"{mode_badge}\n\n**Thinking:** {animated}")
+
+            # Modular RAG for final deep answer
+            time.sleep(0.25)
+            placeholder.markdown(f"{mode_badge}\n\n🔁 Reasoning...\n\n• ✏️ Drafting initial answer...")
+            rag_result = modular_rag_smart_answer(context, query, lang=language)
+            final_answer = rag_result.get("final", rag_result.get("error", "❌ Something went wrong."))
+
+        else:
+            # Vanilla RAG
+            final_answer = vanilla_rag_answer(context, query, lang=language)
+            rag_result = {
+                "thinking": "",
+                "primary": final_answer,
+                "critique": "",
+                "final": final_answer,
+            }
+
+        # Animate final answer
+        animated = "|"
+        for c in final_answer:
+            animated += c
+            placeholder.markdown(f"{mode_badge}\n\n{animated}|")
+            time.sleep(0.004)
+        placeholder.markdown(f"{mode_badge}\n\n{animated}")
+
+    except Exception as e:
+        placeholder.markdown(f"❌ Error: {e}")
+        final_answer = f"Error: {e}"
+        rag_result = {"final": final_answer}
+
+    return final_answer, rag_result, mode_badge
+
+
+# ----------------------
+# 4️⃣ Chat input handler
+# ----------------------
 if user_query := st.chat_input("Ask me about BITS Pilani anything"):
     query = user_query.strip()
     if not query:
         st.warning("Please type a question.")
     else:
-        # Append user message to local history and display
         st.session_state.chat_history.append({"role": "user", "content": query})
         with st.chat_message("user"):
             st.markdown(query)
 
-        # Build context from retriever and uploaded content
+        # Retrieve context
         try:
             docs = retriever.get_relevant_documents(query)
             context = "\n".join([doc.page_content for doc in docs]) if docs else (
@@ -323,75 +507,34 @@ if user_query := st.chat_input("Ask me about BITS Pilani anything"):
             context = st.session_state.get("uploaded_content", "") or ""
             st.warning(f"Retriever failed: {e}")
 
-        # Generate response
-        with st.chat_message("assistant"):
-            thinking_placeholder = st.empty()
-            try:
-                use_smart = bool(st.session_state.get("use_smart_llm", False))
-                mode_badge = "🧠Deep Thinking" if use_smart else "⚡Quick Answer"
-                thinking_placeholder.markdown(f"{mode_badge} — preparing response...")
+        # Decide pipeline automatically using semantic DeepThink
+        use_deepthink = should_use_deepthink(query)
 
-                if use_smart:
-                    # Smart pipeline
-                    thinking_prompt = build_thinking_prompt(query, context)
-                    thinking_text = query_models_with_fallbacks([MODEL_CHEAP] + MODEL_FALLBACKS, thinking_prompt)
+        # Execute selected pipeline
+        final_answer, rag_result, mode_badge = execute_pipeline(
+            query, context, language, use_deepthink
+        )
 
-                    animated = ""
-                    for ch in thinking_text:
-                        animated += ch
-                        thinking_placeholder.markdown(f"{mode_badge}\n\n**Thinking:** {animated}|")
-                        time.sleep(0.01)
-                    thinking_placeholder.markdown(f"{mode_badge}\n\n**Thinking:** {animated}")
+        st.session_state.chat_history.append({"role": "assistant", "content": final_answer})
+        st.session_state.just_streamed = True
 
-                    time.sleep(0.25)
-                    thinking_placeholder.markdown(f"{mode_badge}\n\n🔁 Reasoning...\n\n• ✏️ Drafting initial answer...")
+        # Save chat to Firebase if logged in
+        if "uid" in st.session_state:
+            save_user_chat_history(st.session_state.uid, st.session_state.chat_history)
+# ----------------- Display chat history (non-streamed older messages) -----------------
+if st.session_state.just_streamed and len(st.session_state.chat_history) > 0:
+    history_to_show = st.session_state.chat_history[:-1]
+else:
+    history_to_show = st.session_state.chat_history
 
-                    rag_result = modular_rag_smart_answer(context, query, lang=language)
-                    final_answer = rag_result.get("final", rag_result.get("error", "❌ Something went wrong."))
-                else:
-                    # Vanilla pipeline
-                    final_answer = vanilla_rag_answer(context, query, lang=language)
-                    rag_result = {
-                        "thinking": "",
-                        "primary": final_answer,
-                        "critique": "",
-                        "final": final_answer,
-                    }
+for chat in (history_to_show):
+    with st.chat_message("user" if chat.get("role") == "user" else "assistant"):
+        st.markdown(chat.get("content", ""))
 
-                # Save response to local session history
-                chat_record = {
-                    "question": query,
-                    "thinking": rag_result.get("thinking", ""),
-                    "primary": rag_result.get("primary", ""),
-                    "critique": rag_result.get("critique", ""),
-                    "final": rag_result.get("final", rag_result.get("error", "Sorry — something went wrong.")),
-                    "language": language
-                }
+if st.session_state.just_streamed:
+    st.session_state.just_streamed = False
 
-                final_answer = chat_record["final"]
-                animated = ""
-                for c in final_answer:
-                    animated += c
-                    thinking_placeholder.markdown(f"{mode_badge}\n\n" + animated + "|")
-                    time.sleep(0.004)
-                thinking_placeholder.markdown(f"{mode_badge}\n\n" + animated)
-
-                # Append assistant message to session state
-                st.session_state.chat_history.append({"role": "assistant", "content": final_answer})
-
-            except Exception as e:
-                thinking_placeholder.markdown(f"❌ Error: {e}")
-                st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "content": f"Error: {e}"
-                })
-
-# ----------------- Optional: Display full chat history -----------------
-for message in st.session_state.chat_history:
-    role = message["role"]
-    content = message["content"]
-    with st.chat_message(role):
-        st.markdown(content)
+# ----------------- Sidebar history preview -----------------
 
 # ----------------- Footer -----------------
 st.markdown(
@@ -418,3 +561,4 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
