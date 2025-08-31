@@ -1,4 +1,3 @@
-# cleaned_buddy.py
 import os
 import time
 import hashlib
@@ -32,6 +31,48 @@ K_VAL = int(os.getenv("K_VAL") or 4)
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH") or "./llm_cache.db"
 ENABLE_PERSISTENT_CACHE = True
 
+# ----------------- utilities for firebase chat history -----------------
+def load_user_chat_history(uid: str) -> List[Dict[str, Any]]:
+    try:
+        ref = db.reference(f"user_chats/{uid}")
+        snapshot = ref.get()
+        if not snapshot:
+            return []
+        chat_data = snapshot.get("chat")
+        if isinstance(chat_data, list):
+            return chat_data
+        st.warning(f"Unexpected chat format for UID {uid}, resetting history.")
+        return []
+    except Exception as e:
+        st.error(f"Failed to load chat history for UID {uid}: {e}")
+        return []
+
+
+def save_user_chat_history(uid: str, chat: List[Dict[str, Any]]) -> bool:
+    try:
+        ref = db.reference(f"user_chats/{uid}")
+        ref.set({"chat": chat})
+        return True
+    except Exception as e:
+        st.error(f"Failed to save chat history for UID {uid}: {e}")
+        return False
+
+# ----------------- FIREBASE INIT -----------------
+if not firebase_admin._apps:
+    try:
+        firebase_config = dict(st.secrets["firebase"])
+        firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
+        database_url = st.secrets["firebase"]["database_url"]
+        cred = credentials.Certificate(firebase_config)
+        firebase_admin.initialize_app(cred, {"databaseURL": database_url})
+    except Exception as e:
+        st.error(f"Firebase initialization failed: {e}")
+        st.stop()
+else:
+    firebase_admin.get_app()
+
+realtime_db = db.reference('/')
+
 # ----------------- Streamlit page & sidebar -----------------
 st.set_page_config(page_title="BITS Buddy", layout="wide")
 col1, col2 = st.columns([1, 5])
@@ -58,7 +99,7 @@ with st.sidebar:
         st.session_state.just_streamed = False
         st.rerun()
 
-    language = st.selectbox("🌐 Response Language", ["English", "Hindi", "Telugu", "Tamil", "Marathi", "Bengali"])
+    #language = st.selectbox("🌐 Response Language", ["English", "Hindi", "Telugu", "Tamil", "Marathi", "Bengali"])
     #st.checkbox("🧠Deep Think", value=False, key="use_smart_llm") 
     st.markdown("---")
     #st.checkbox("For fast loading", value=ENABLE_PERSISTENT_CACHE, key="enable_sqlite")
@@ -291,6 +332,48 @@ def vanilla_rag_answer(context: str, question: str, lang: str = "English") -> st
     except Exception as e:
         return f"⚠️ Error generating answer: {e}"
 
+# ----------------- Session init -----------------
+if "authenticated" in st.session_state and st.session_state["authenticated"]:
+    if "chat_history" not in st.session_state:
+        uid = st.session_state.get("user_uid")
+        st.session_state.chat_history = load_user_chat_history(uid) if uid else []
+    if "just_streamed" not in st.session_state:
+        st.session_state.just_streamed = False
+else:
+    # show login screen if not authenticated (define login_screen elsewhere or reuse your function)
+    def login_screen():
+        st.title("🔐 BITS Buddy Login")
+        st.markdown("Please log in to continue")
+        name = st.text_input("Full Name")
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        if st.button("Login / Sign Up"):
+            if not name or not email or not password:
+                st.error("Please fill in all fields.")
+                return False
+            try:
+                email_norm = email.strip().lower()
+                try:
+                    user = auth.get_user_by_email(email_norm)
+                    st.success(f"Welcome back, {user.display_name or name}!")
+                    st.session_state.uid = user.uid
+                    st.session_state.chat_history = load_user_chat_history(user.uid)
+                except auth.UserNotFoundError:
+                    user = auth.create_user(email=email_norm, password=password, display_name=name)
+                    st.success(f"Account created! Welcome, {name}!")
+                    st.session_state.uid = user.uid
+                    st.session_state.chat_history = []
+                st.session_state["user_uid"] = user.uid
+                st.session_state["user_name"] = name
+                st.session_state["authenticated"] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"Authentication failed: {e}")
+                return False
+
+    login_screen()
+    st.stop()
+
 # ----------------- Main chat handler (auto pipeline selection) -----------------
 import time
 import streamlit as st
@@ -477,4 +560,3 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
